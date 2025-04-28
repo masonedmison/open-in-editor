@@ -95,7 +95,7 @@ class BaseEditor(object):
         path_head = path_head + os.sep if path_head else path_head # add / back if it existed
         executable_path = path_head + path_bin
 
-        editors = [Emacs, Sublime, PyCharm, VSCode, Vim, Neovim, Helix, Zed, O]
+        editors = [Neovim]
 
         inferred_editor = next((ed for ed in editors if path_bin == ed.executable_name), None)
         if inferred_editor is None:
@@ -108,14 +108,14 @@ class BaseEditor(object):
                 % (OPEN_IN_EDITOR, EDITOR, ", ".join(ed.executable_name for ed in editors))
             )
             sys.exit(1)
-        return inferred_editor(executable_path)
+        return inferred_editor()
 
     @classmethod
     def infer_from_environment_variables(cls):
         """
         Infer the editor type and its executable path heuristically from environment variables.
         """
-        executable_path_with_arguments_maybe = OPEN_IN_EDITOR or EDITOR
+        executable_path_with_arguments_maybe = "nvim"
 
         return cls.infer_editor_from_path(executable_path_with_arguments_maybe)
 
@@ -125,89 +125,127 @@ class BaseEditor(object):
     def visit_file(self, path, line, column):
         raise NotImplementedError()
 
+class KittyController:
+    """
+    Simple class to interact with Kitty's remote control protocol using socket files
+    """
+    def __init__(self, kitty_executable):
+        self.kitty_executable = kitty_executable
+        self.socket_path = self._get_kitty_socket()
 
-class Emacs(BaseEditor):
-    executable_name = 'emacsclient'
-    def visit_file(self, path, line, column):
-        cmd = [
-            self.executable,
-            "--no-wait",
-            "--eval",
-            '(find-file "%s")' % path,
-            "--eval",
-            "(goto-line %d)" % line,
-            "--eval",
-            "(recenter-top-bottom)",
-            "--eval",
-            "(select-frame-set-input-focus (selected-frame))",
-            "--eval",
-            "(when (functionp 'pulse-momentary-highlight-one-line)"
-            " (let ((pulse-delay 0.05)) (pulse-momentary-highlight-one-line (point) 'highlight)))",
+    def _get_kitty_socket(self):
+        """
+        Get the Kitty socket path by looking for sockets in /tmp with the format /tmp/mykitty-PID
+        """
+        # Look for sockets in /tmp with the format /tmp/mykitty-PID
+        try:
+            import glob
+            kitty_sockets = glob.glob('/tmp/mykitty-*')
+            if kitty_sockets:
+                # Get the first available socket
+                socket_path = kitty_sockets[0]
+                log_info(f"Found Kitty socket: {socket_path}")
+
+                # Make sure it has the unix: prefix
+                if not socket_path.startswith('unix:'):
+                    socket_path = f'unix:{socket_path}'
+
+                return socket_path
+        except Exception as e:
+            log_error(f"Error finding Kitty socket: {str(e)}")
+
+        log_info("No Kitty socket found")
+        return None
+
+    def is_kitty_running(self):
+        """
+        Check if Kitty is running by checking if a socket path was found
+        """
+        return self.socket_path is not None
+
+    def launch_tab(self, command, tab_title=None):
+        """
+        Launch a new tab in an existing Kitty window with the specified command
+        """
+        if not self.socket_path:
+            return False
+
+        try:
+            cmd = [self.kitty_executable, '@', '--to', self.socket_path, 'launch', '--type=tab']
+            if tab_title:
+                cmd.extend(['--tab-title', tab_title])
+            cmd.append('--')
+            cmd.extend(command)
+
+            log_info(f"Launching new tab with command: {' '.join(cmd)}")
+
+            subprocess.run(cmd, check=True)
+            return True
+        except subprocess.SubprocessError as e:
+            log_error(f"Error launching new tab: {str(e)}")
+            return False
+
+class Neovim(BaseEditor):
+    executable_name = "nvim"
+
+    def __init__(self):
+        nvim_paths = [
+            "/etc/profiles/per-user/medmison/bin/nvim",
         ]
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
 
+        for nvim_path in nvim_paths:
+            if os.path.exists(nvim_path) and os.access(nvim_path, os.X_OK):
+                self.executable = nvim_path
+                return
 
-class PyCharm(BaseEditor):
-    executable_name = 'charm'
+        raise Exception(f"Unable to find Neovim in any of {''.join(nvim_paths)}")
+
     def visit_file(self, path, line, column):
-        cmd = [self.executable, "--line", str(line), path]
-        log_info(" ".join(cmd))
-        subprocess.check_call([s.encode("utf-8") for s in cmd])
+        # Build nvim command with line and column arguments
+        nvim_args = ["+%s" % str(line)]
+        if column > 1:
+            nvim_args.extend(["-c", "normal %sl" % str(column - 1)])
+        nvim_args.append(path)
 
+        # Find kitty executable
+        kitty_paths = [
+            "/etc/profiles/per-user/medmison/bin/kitty"
+        ]
 
-class Sublime(BaseEditor):
-    executable_name = 'subl'
-    def visit_file(self, path, line, column):
-        cmd = [self.executable, "%s:%s:%s" % (path, line, column)]
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
+        kitty_executable = None
+        for kitty_path in kitty_paths:
+            if os.path.exists(kitty_path) and os.access(kitty_path, os.X_OK):
+                kitty_executable = kitty_path
+                break
 
+        if not kitty_executable:
+            raise Exception(f"Unable to find kitty executable at any of {''.join(kitty_paths)}")
 
-class VSCode(BaseEditor):
-    executable_name = 'code'
-    def visit_file(self, path, line, column):
-        cmd = [self.executable, "-g", "%s:%s:%s" % (path, line, column)]
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
+        # Initialize Kitty controller
+        kitty = KittyController(kitty_executable)
 
+        # Get the filename for the tab title
+        filename = os.path.basename(path)
 
-class Vim(BaseEditor):
-    executable_name = 'vim'
-    def visit_file(self, path, line, column):
-        cmd = [self.executable, "+%s" % str(line)]
-        cmd.extend(["-c", "normal %sl" % str(column - 1), path] if column > 1 else [path])
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
+        # Check if KITTY_LISTEN_ON is set (indicating a running Kitty instance)
+        if kitty.is_kitty_running():
+            # Launch a new tab with Neovim
+            cmd = [self.executable] + nvim_args
+            if kitty.launch_tab(cmd, tab_title=filename):
+                log_info(f"Successfully launched new tab with {filename}")
+                return
+            else:
+                log_info("Failed to launch new tab, falling back to new window")
+        else:
+            log_info("No kitty socket found, launching new window")
 
+        # If KITTY_LISTEN_ON is not set or we couldn't use it, launch a new Kitty window
+        cmd = [kitty_executable, self.executable] + nvim_args
+        log_info(f"Launching new Kitty with command: {cmd}")
 
-class Neovim(Vim):
-    executable_name = 'nvim'
-
-
-class Helix(BaseEditor):
-    executable_name = 'hx'
-    def visit_file(self, path, line, column):
-        cmd = [self.executable, "%s:%s:%s" % (path, line, column)]
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
-
-
-class Zed(BaseEditor):
-    executable_name = 'zed'
-    def visit_file(self, path, line, column):
-        cmd = [self.executable, "%s:%s:%s" % (path, line, column)]
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
-
-
-class O(BaseEditor):
-    executable_name = 'o'
-    def visit_file(self, path, line, column):
-        cmd = [self.executable, path, "+%s" % str(line), "+%s" % str(column)]
-        log_info(" ".join(cmd))
-        subprocess.check_call(cmd)
-
+        process = subprocess.Popen(cmd)
+        log_info(f"Kitty with nvim launched successfully (PID: {process.pid})")
 
 if __name__ == "__main__":
     main()
+
